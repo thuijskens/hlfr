@@ -32,13 +32,12 @@ def _compute_npv(confusion_matrix):
 
 
 def compute_bounds(p_hat, decay, n, alpha, n_sim=1000):
+    bernoulli_samples = bernoulli.rvs(p_hat, size=n * n_sim).reshape(n_sim, n)
+    # TODO: Check if shapes match
 
-    def _simulate_bounds(p, n_ber, eta):
-        bernoulli_samples = bernoulli.rvs(p, size=n_ber)
-        return (1 - eta) * np.sum(np.power(eta, n_ber - np.arange(1, n_ber + 1)) * bernoulli_samples)
-
-    empirical_bounds = np.asarray([_simulate_bounds(p_hat, n, decay) for i in range(n_sim)])
-    lb, ub = np.percentile(empirical_bounds, q=[alpha, 1 - alpha])
+    #empirical_bounds = (1 - decay) * (bernoulli_samples * (n - np.arange(1, n + 1))).sum(axis=1)
+    empirical_bounds = (1 - decay) * np.matmul(bernoulli_samples, decay ** (n - np.arange(1, n + 1)).reshape(n, 1)).sum(axis=1)
+    lb, ub = np.percentile(empirical_bounds, q=[alpha * 100, (1 - alpha) * 100])
 
     return lb, ub
 
@@ -51,7 +50,6 @@ def find_nearest(array, value):
         return array[idx]
 
 
-METRIC_MAPPING = {0: 'tpr', 1: 'tnr', 2: 'ppv', 3: 'npv'}
 METRICS_FUNCTION_MAPPING = {
     'tpr': _compute_tpr,
     'tnr': _compute_tnr,
@@ -88,7 +86,7 @@ class StreamingConfusionMatrix(object):
 
 
 class PerformanceMetric(object):
-    def __init__(self, metric_name, decay, warn_level, detect_level):
+    def __init__(self, metric_name, decay):
         """
         decay is a function
 
@@ -100,8 +98,6 @@ class PerformanceMetric(object):
 
         self.metric_name = metric_name
         self.decay = decay
-        self.warn_level = warn_level
-        self.detect_level = detect_level
         self.metric_value = [0.5]
 
         self._R = [0.5]
@@ -113,7 +109,6 @@ class PerformanceMetric(object):
 
     def update_metric(self, confusion_matrix, y_true, y_pred):
 
-        # can also do all the computations here
         self.metric_value.append(METRICS_FUNCTION_MAPPING[self.metric_name](confusion_matrix))
 
         r_hat = self.update_decay(y_true, y_pred)
@@ -121,11 +116,8 @@ class PerformanceMetric(object):
 
         return n, p_hat, r_hat
 
-    def metric_changed(self, t1=None, t2=None):
-        if t1 is None or t2 is None:
-            return abs(self.metric_value[-1] - self.metric_value[-2]) > 0
-        else:
-            return abs(self.metric_value[t1] - self.metric_value[t2]) > 0
+    def metric_changed(self):
+        return abs(self.metric_value[-1] - self.metric_value[-2]) > 0
 
     def update_decay(self, y_true, y_pred):
         if self.metric_changed():
@@ -163,10 +155,11 @@ class BoundsTable(object):
     def compute_bounds_table(self, rng_seed=123321):
         np.random.seed(rng_seed)
         grid = itertools.product(self.p_hat_range, self.n_range, self.alpha_range)
-        self.bounds_table = {(p, n): compute_bounds(p_hat=p, alpha=alpha, decay=self.decay, n=n, n_sim=self.n_sim)
+        # TODO: Is it safe to store dictionary keys as floating point values?
+        self.bounds_table = {(p, n, alpha): compute_bounds(p_hat=p, alpha=alpha, decay=self.decay, n=n, n_sim=self.n_sim)
                              for (p, n, alpha) in grid}
 
-        return self.bounds_table
+        return self
 
     def lookup_bounds(self, p, n, alpha):
         # We assume here that n and alpha can be exactly matched
@@ -179,13 +172,13 @@ class LinearFourRates(object):
     The way we code LFR will be that it takes the whole data set, and detects all potential drift points in the time
     series.
     """
-    def __init__(self, decay, warn_level, detect_level, n_sim=10000):
+    def __init__(self, decay, warn_level, detect_level, bounds_table=None):
         self.decay = decay
         self.warn_level = warn_level
         self.detect_level = detect_level
-        self.n_sim = n_sim
+        self.bounds_table = bounds_table
 
-        self.metrics = {metric_name: PerformanceMetric(metric_name, decay, warn_level, detect_level)
+        self.metrics = {metric_name: PerformanceMetric(metric_name, decay)
                         for metric_name in ['tpr', 'tnr', 'ppv', 'npv']}
         self.warn_time = 0
         self.confusion_matrix = StreamingConfusionMatrix()
@@ -193,25 +186,25 @@ class LinearFourRates(object):
 
     def _compute_bounds_table(self, n_samples, rng_seed=123321):
         alpha_range = np.array([self.warn_level, self.detect_level])
-        p_hat_range = np.linspace(0.0, 1.0, 100)
-        n_range = np.arange(n_samples)
+        p_hat_range = np.arange(1, 100) / 100.0
+        n_range = np.arange(2, n_samples + 1)
 
         self.bounds_table = BoundsTable(self.decay, alpha_range, p_hat_range, n_range, n_sim=self.n_sim)
         self.bounds_table.compute_bounds_table(rng_seed=rng_seed)
 
         return self.bounds_table
 
-    #def detect_drift_points(self, estimator, X, y):
     def detect_drift_points(self, y_obs, y_pred):
         """
         Data API. This takes the model and the data, and computes the performance metrics and confusion matrix
         before passing these on to _detect_drift_point
         """
         n_samples = y_obs.shape[0]
-        self._compute_bounds_table(n_samples)
+
+        if self.bounds_table is None:
+            self._compute_bounds_table(n_samples)
 
         for t, (y, y_hat) in enumerate(zip(y_obs, y_pred)):
-            #y_pred = estimator.predict(X[t, :])
             self.confusion_matrix.update_confusion_matrix(y, y_hat)
 
             warnings = []
@@ -223,16 +216,20 @@ class LinearFourRates(object):
                 lb_warn, ub_warn = self.bounds_table.lookup_bounds(p=p_hat, n=n, alpha=self.warn_level)
                 lb_detect, ub_detect = self.bounds_table.lookup_bounds(p=p_hat, n=n, alpha=self.detect_level)
 
-                warn_shift = (r_hat <= lb_warn or r_hat >= ub_warn)
-                detect_shift = (r_hat <= lb_detect or r_hat >= ub_detect)
+                warn_shift = (r_hat <= lb_warn) or (r_hat >= ub_warn)
+                detect_shift = (r_hat <= lb_detect) or (r_hat >= ub_detect)
+
+                # NOTE: lb = ub = 0.0. So r_hat >= ub_warn is satisfied... bounds table computation is wrong
+                print("Sample %i: metric %s, R: %.3f, Warn LB: %.3f Warn UB: %.f, Detect LB: %.3f, Detect UB: %.3f, warn: %s detect: %s"
+                      % (t, metric.metric_name, r_hat, lb_warn, ub_warn, lb_detect, ub_detect, warn_shift, detect_shift))
 
                 warnings.append(warn_shift)
                 detections.append(detect_shift)
 
-            if any(warnings) and self.warn_time == 0:
+            if any(warnings) and self.warn_time is None:
                 self.warn_time = t
-            elif all([not warning for warning in warnings]):
-                self.warn_time = 0
+            elif all([not warning for warning in warnings]) and self.warn_time is not None:
+                self.warn_time = None
 
             if any(detections):
                 self.concept_shift_times.append(t)
@@ -243,7 +240,7 @@ class LinearFourRates(object):
                 for metric in self.metrics.values():
                     metric.reset_internals()
 
-            if t % 10 == 0:
+            if t % 100 == 0:
                 print("Sample %i" % t)
 
         return self
